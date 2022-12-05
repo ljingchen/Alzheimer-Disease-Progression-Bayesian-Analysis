@@ -1,0 +1,659 @@
+---
+title: "BIS 567 Final Project"
+author: "Jingchen Liang, Ruyi Liu"
+date: "10/13/2022"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(rstan)
+library(loo)
+library(msm)
+library(mnormt)
+library(ggpubr)
+library(corrplot)
+#library(brms)
+```
+
+
+# Part 0. Data Import
+
+```{r}
+setwd("/Users/jingchen/Desktop/BIS 567/Final Project/")
+
+alzheimer <- read.csv("ADNIMERGE.csv", na.strings = c("", "NA"))
+dim(alzheimer)  ## 16186 obs & 116 cols
+colnames(alzheimer)
+```
+
+# Part 1. Data Cleaning
+
+Variables related to assessment scores:   
+
+* ADAS11, ADAS13, ADASQ4 (Alzheimer's disease assessment score)
+* CDR: Clinical Dementia Rating Scale
+* DIGITSCOR: Digit Symbol Substitution
+* ECog: Everyday Cognition
+* FAQ: Functional Assessment Questionnaire
+* LDELTOTAL: Delayed Recall Total
+* MMSE: Mini Mental State Evaluation
+* MOCA: Score Montreal Cognitive Assessment (MOCA) without Education Adjustment
+* PACC: Preclinical Alzheimer's Cognitive Composite
+* RAVLT: Rey Auditory Verbal Learning Test
+* TRABSCOR: Trail Making Test
+
+Reference: 
+https://www.stat.uci.edu/wp-content/uploads/Data-Analysis_FYQE_2021.pdf
+https://adni.bitbucket.io/reference/pacc.html
+https://adni.bitbucket.io/reference/scoreMOCA.html
+https://adni.bitbucket.io/reference/neurobat.html
+https://adni.bitbucket.io/reference/docs/UWNPSYCHSUM/ADNI_Methods_UWNPSYCHSUM_May_2018.pdf
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4247808/
+https://hardy-lab-statistical-genetics.github.io/p/introduction-to-adni-dataset/
+https://adni.bitbucket.io/reference/faq.html
+https://adni.loni.usc.edu/wp-content/uploads/2008/07/inst_commonly_used_table.pdf
+https://ac209a-alzheimersproject.github.io/alzheimers-project/eda.html
+
+
+Numeric Variables:
+ICV: intracranial volume
+Hippocampus = hippocampal volume
+Entorhinal = entorhinal cortex volume
+WholeBrain = entire brain volume
+MidTemp = middle temporal gyrus volumme
+
+
+
+```{r, warning=FALSE, message=FALSE}
+# delete useless and repeated columns
+alzheimer1 <- alzheimer[ , -which(names(alzheimer) %in% c("COLPROT","ORIGPROT","PTID","SITE","VISCODE","FLDSTRENG",
+       "FSVERSION","IMAGEUID","FLDSTRENG_bl","FSVERSION_bl","IMAGEUID_bl","update_stamp","M","Month_bl"))]
+# delete examination scores: ADAS11, ADAS13, ADASQ4, CDR, DIGITSCOR, ECog, FAQ, LDELTOTAL, MMSE, MOCA, PACC, RAVLT, TRABSCOR
+alzheimer1 <- alzheimer1[ , -which(names(alzheimer1) %in% c("ADAS11","ADAS11_bl","ADAS13","ADAS13_bl","ADASQ4",
+       "ADASQ4_bl","CDRSB","CDRSB_bl","DIGITSCOR","DIGITSCOR_bl","EcogPtDivatt","EcogPtDivatt_bl",
+       "EcogPtLang","EcogPtLang_bl","EcogPtMem","EcogPtMem_bl","EcogPtOrgan","EcogPtOrgan_bl",
+       "EcogPtPlan","EcogPtPlan_bl","EcogPtTotal","EcogPtTotal_bl","EcogPtVisspat","EcogPtVisspat_bl",
+       "EcogSPDivatt","EcogSPDivatt_bl","EcogSPLang","EcogSPLang_bl","EcogSPMem","EcogSPMem_bl",
+       "EcogSPOrgan","EcogSPOrgan_bl","EcogSPPlan","EcogSPPlan_bl","EcogSPTotal","EcogSPTotal_bl",
+       "EcogSPVisspat","EcogSPVisspat_bl","FAQ","FAQ_bl","LDELTOTAL","LDELTOTAL_BL","MMSE","MMSE_bl",
+       "MOCA","MOCA_bl","mPACCdigit","mPACCdigit_bl","mPACCtrailsB","mPACCtrailsB_bl","RAVLT_forgetting",
+       "RAVLT_forgetting_bl","RAVLT_immediate","RAVLT_immediate_bl","RAVLT_learning","RAVLT_learning_bl",
+       "RAVLT_perc_forgetting","RAVLT_perc_forgetting_bl","TRABSCOR","TRABSCOR_bl"))]
+# sort the original data by RID, and the examination date for each patient
+alzheimer1 <- alzheimer1[order(alzheimer1$RID, alzheimer1$EXAMDATE),]   # 16186 obs & 42 cols
+# delete all rows if a patient only have one record - all records with Month = 0
+one_record <- as.data.frame(alzheimer1 %>% group_by(RID) %>% tally())
+alzheimer2 <- alzheimer1[which(!alzheimer1$RID %in% one_record$RID[which(one_record$n == 1)]),]  # 15930 obs & 42 cols
+# check if any baseline diagnostic information is missing for each patient - all have been deleted
+first_diag_miss <- alzheimer2[which(alzheimer2$Month == 0),][,c("RID","DX")]
+dim(alzheimer2[which(alzheimer2$RID %in% first_diag_miss$RID[is.na(first_diag_miss$DX)]),])
+# recreate the baseline diagnosis (Month = number of months since baseline visit: baseline visit is month 0)
+first_diag <- alzheimer2[which(alzheimer2$Month == 0),][,c("RID","DX")]
+colnames(first_diag) <- c("RID","DX_bl_new")
+alzheimer3 <- merge(alzheimer2,first_diag,by="RID")  # 15930 obs & 42 cols
+alzheimer3$DX_bl <- NULL
+# check if any last diagnostic information is missing for each patient - 778 patients
+last_diag_miss <- alzheimer3 %>% group_by(RID) %>% arrange(EXAMDATE) %>% slice(n())
+# delete missing rows separately: last record missing or non-missing patients, then combine the data
+# if there are only two rows for each patients, we will remove all rows
+# if there are more than two rows, we go backward in time to find the record that is not missing. If there are 
+# still missing values up to the baseline, we delete all records for that patient.
+# (1) for patients last record missing  
+last_miss_subset <- alzheimer3[which(alzheimer3$RID %in% 
+                              last_diag_miss$RID[is.na(last_diag_miss$DX)]),]
+last_miss_subset1 <- last_miss_subset[which(!is.na(last_miss_subset$DX)),]  # no missing for DX in this dataset
+# if only one record, delete
+one_record1 <- as.data.frame(last_miss_subset1 %>% group_by(RID) %>% tally())
+last_miss_subset2 <- last_miss_subset1[which(!last_miss_subset1$RID %in% one_record1$RID[which(one_record1$n == 1)]),]
+# (2) for patients last record non-missing  
+rest_miss_subset <- alzheimer3[which(!alzheimer3$RID %in% 
+                              last_diag_miss$RID[is.na(last_diag_miss$DX)]),]
+rest_miss_subset1 <- rest_miss_subset[which(!is.na(rest_miss_subset$DX)),]  # no missing for DX in this dataset
+# if only one record, delete 
+one_record2 <- as.data.frame(rest_miss_subset1 %>% group_by(RID) %>% tally())
+sum(one_record2$n == 1)  # all have at least 2 records
+# combine the data - no missing values for DX or DX_bl_new in alzheimer4, and each patient has at least 2 records
+alzheimer4 <- rbind(rest_miss_subset1,last_miss_subset2)   # # 10987 obs & 42 cols
+length(unique(alzheimer4$RID))  # 2061 unique patients
+sort(colSums(sapply(alzheimer4[which(colSums(is.na(alzheimer4)) > 0)], is.na)), decreasing = TRUE)
+# variable selection 1
+alzheimer5 <- alzheimer4[ , -which(names(alzheimer4) %in% 
+                 c("EXAMDATE","EXAMDATE_bl","PTMARRY","PIB","PIB_bl","FBB","FBB_bl","Fusiform","Fusiform_bl",
+                   "Years_bl","ICV","ICV_bl","Ventricles","Ventricles_bl"))]
+# "AV45","AV45_bl","FDG","FDG_bl","PTAU","PTAU_bl","ABETA","ABETA_bl","TAU","TAU_bl"
+sort(colSums(sapply(alzheimer5[which(colSums(is.na(alzheimer5)) > 0)], is.na)), decreasing = TRUE)
+# change to numeric variables
+alzheimer5$ABETA <- as.numeric(alzheimer5$ABETA)
+alzheimer5$ABETA_bl <- as.numeric(alzheimer5$ABETA_bl)
+alzheimer5$TAU <- as.numeric(alzheimer5$TAU)
+alzheimer5$TAU_bl <- as.numeric(alzheimer5$TAU_bl)
+alzheimer5$PTAU <- as.numeric(alzheimer5$PTAU)
+alzheimer5$PTAU_bl <- as.numeric(alzheimer5$PTAU_bl)
+
+# calculate the difference
+alzheimer5$FDG_diff <- alzheimer5$FDG - alzheimer5$FDG_bl
+alzheimer5$FDG <- NULL
+alzheimer5$FDG_bl <- NULL
+alzheimer5$AV45_diff <- alzheimer5$AV45 - alzheimer5$AV45_bl
+alzheimer5$AV45 <- NULL
+alzheimer5$AV45_bl <- NULL
+alzheimer5$ABETA_diff <- alzheimer5$ABETA - alzheimer5$ABETA_bl
+alzheimer5$ABETA <- NULL
+alzheimer5$ABETA_bl <- NULL
+alzheimer5$TAU_diff <- alzheimer5$TAU - alzheimer5$TAU_bl
+alzheimer5$TAU <- NULL
+alzheimer5$TAU_bl <- NULL
+alzheimer5$PTAU_diff <- alzheimer5$PTAU - alzheimer5$PTAU_bl
+alzheimer5$PTAU <- NULL
+alzheimer5$PTAU_bl <- NULL
+alzheimer5$Hippocampus_diff <- alzheimer5$Hippocampus - alzheimer5$Hippocampus_bl
+alzheimer5$Hippocampus <- NULL
+alzheimer5$Hippocampus_bl <- NULL
+alzheimer5$WholeBrain_diff <- alzheimer5$WholeBrain - alzheimer5$WholeBrain_bl
+alzheimer5$WholeBrain <- NULL
+alzheimer5$WholeBrain_bl <- NULL
+alzheimer5$Entorhinal <- alzheimer5$Entorhinal - alzheimer5$Entorhinal_bl
+alzheimer5$Entorhinal <- NULL
+alzheimer5$Entorhinal_bl <- NULL
+alzheimer5$MidTemp_diff <- alzheimer5$MidTemp - alzheimer5$MidTemp_bl
+alzheimer5$MidTemp <- NULL
+alzheimer5$MidTemp_bl <- NULL
+# variable selection 2
+alzheimer6 <- alzheimer5[ , -which(names(alzheimer5) %in% 
+                 c("ABETA_diff","PTAU_diff","TAU_diff","AV45_diff"))]
+alzheimer7 <- alzheimer6[complete.cases(alzheimer6), ]  # no missing in this dataset
+# colSums(is.na(alzheimer7))
+# only select the last record for each patient
+alzheimer8 <- as.data.frame(alzheimer7 %>% group_by(RID) %>% slice(n()))
+alzheimer_final <- alzheimer8[which(alzheimer8$Month != 0),]
+# create an outcome progression variable Y to indicate the presence or absence of disease progression
+# no patients from Dementia to CN or from Dementia to MCI, but 18 patients from MCI to CN
+# alzheimer_final[which(alzheimer_final$DX == "MCI" & alzheimer_final$DX_bl_new == "Dementia"),]
+# alzheimer_final[which(alzheimer_final$DX == "CN" & alzheimer_final$DX_bl_new == "Dementia"),]
+alzheimer_final$Y <- ifelse(alzheimer_final$DX == alzheimer_final$DX_bl_new, 0,
+                    ifelse(alzheimer_final$DX == "CN" & alzheimer_final$DX_bl_new == "MCI", 0 ,1))
+# 561 patients
+nrow(alzheimer_final)
+```
+
+```{r}
+# store the clean data
+# write.csv(alzheimer_final, "/Users/Jingchen/Desktop/alzheimer_final.csv", row.names = FALSE)
+```
+
+
+```{r}
+#df <- read.csv(file = '/Users/jingchen/Desktop/alzheimer_final.csv', header = TRUE)
+df <- alzheimer_final
+head(df)
+dim(df)
+
+# reformat the variables
+# 1. Gender: Male = 1, Female = 0
+df$Gender <- ifelse(df$PTGENDER == "Male", 1, 0)
+df$PTGENDER <- NULL
+df$DX_bl_new <- NULL
+df$DX <- NULL
+df$Month <- NULL
+df$PTETHCAT <- NULL
+# 2. Race: White = 1, Non_White = 0
+df$Race <- ifelse(df$PTRACCAT == "White", 1, 0)
+df$PTRACCAT <- NULL
+df <- df[,c(1:8,10:11,9)]
+df$RID <- NULL
+head(df)
+
+sd_mat <- scale(as.matrix(df[,-10]))
+sd_df <- data.frame(sd_mat)
+head(sd_df)
+```
+
+```{r}
+# check correlations
+corr_data <- df[,1:7]
+brainCor <- cor(corr_data)
+##Visualize correlations
+corrplot.mixed(brainCor, tl.col="black", tl.pos = "lt")
+```
+
+# Part 2 Bayesian Analysis
+
+## Model 1. Bayesian Logistic Regression
+
+We have defined the log likelihood as a vector named log_lik in the generated quantities block so that the individual terms will be saved by Stan. After running Stan, log_lik can be extracted (using the extract_log_lik function provided in the loo package) as an SxN matrix, where S is the number of simulations (posterior draws) and N is the number of data points.  
+
+```{r model1}
+# Model Organization & Posterior Sampling
+# reference: 
+# https://medewitt.github.io/resources/stan_mult_linear_regression.html
+# https://mc-stan.org/loo/articles/loo2-large-data.html
+# http://mc-stan.org/loo/articles/loo2-with-rstan.html
+# https://moodle2.units.it/pluginfile.php/290156/mod_resource/content/1/stan-users-guide-2_19.pdf
+
+x <- as.matrix(sd_df)
+y <- df$Y
+p = 9
+n = 561
+
+logit_reg_data <- list(y=y, N=n, x=x, P = 9)
+
+# Model Organization & Posterior Sampling
+logit_reg_fit <- stan("/Users/jingchen/Desktop/BIS 567/Final Project/logistic_reg.stan", 
+                      data = logit_reg_data, iter = 100000, warmup = 10000, thin = 10, chains = 3)
+```
+
+```{r}
+# Posterior Inference
+# Summarize the posterior (including effective sample size (n_eff) 
+# and Gelman and Rubin diagnostic (Rhat))
+print(logit_reg_fit, pars = "beta", probs = c(0.025, 0.5, 0.975))
+```
+
+```{r}
+# Trace plots
+rstan::traceplot(logit_reg_fit, pars = "beta", inc_warmup=TRUE)
+```
+
+```{r}
+# We can then use the loo package to compute the efficient PSIS-LOO approximation to exact LOO-CV
+# Extract pointwise log-likelihood
+# using merge_chains=FALSE returns an array, which is easier to 
+# use with relative_eff()
+log_lik_1 <- extract_log_lik(logit_reg_fit, merge_chains = FALSE)
+
+# as of loo v2.0.0 we can optionally provide relative effective sample sizes
+# when calling loo, which allows for better estimates of the PSIS effective
+# sample sizes and Monte Carlo error
+r_eff <- relative_eff(exp(log_lik_1), cores = 2) 
+
+# preferably use more than 2 cores (as many cores as possible)
+# will use value of 'mc.cores' option if cores is not specified
+loo_1 <- loo(log_lik_1, r_eff = r_eff, cores = 2)
+print(loo_1)
+```
+
+The printed output from the `loo` function shows the estimates $\widehat{elpd}_{loo}$ (expected log predictive density), $\widehat{p}_{loo}$ (effective number of parameters), and looic = $-2\widehat{elpd}_{loo}$ (the LOO information criterion).  
+
+The line at the bottom of the printed output provides information about the reliability of the LOO approximation (the interpretation of the k parameter is explained in `help('pareto-k-diagnostic')` and in greater detail in Vehtari, Simpson, Gelman, Yao, and Gabry (2019)). In this case the message tells us that all of the estimates for k are fine.
+
+
+## Model 2. Bayesian Probit Regression
+
+```{r model2}
+# Model Organization & Posterior Sampling
+probit_reg_fit <- stan("/Users/jingchen/Desktop/BIS 567/Final Project/probit_reg.stan", 
+                      data = logit_reg_data, iter = 100000, warmup = 10000, thin = 10, chains = 3)
+```
+
+```{r}
+# Posterior Inference
+# Summarize the posterior (including effective sample size (n_eff) 
+# and Gelman and Rubin diagnostic (Rhat))
+print(probit_reg_fit, pars = "beta", probs = c(0.025, 0.5, 0.975))
+```
+
+```{r}
+# Trace plots
+rstan::traceplot(probit_reg_fit, pars = "beta", inc_warmup=TRUE)
+```
+
+
+Cross-validation: (Leave-one-out cross-validation)   
+rstanarm supports loo package which implements fast Pareto smoothed leave-one-out cross-validation (PSIS-LOO) (Vehtari, Gelman and Gabry, 2017b) to compute expected log predictive density (elpd):
+
+```{r}
+# We can then use the loo package to compute the efficient PSIS-LOO approximation to exact LOO-CV
+# Extract pointwise log-likelihood
+# using merge_chains=FALSE returns an array, which is easier to 
+# use with relative_eff()
+log_lik_2 <- extract_log_lik(probit_reg_fit, merge_chains = FALSE)
+
+# as of loo v2.0.0 we can optionally provide relative effective sample sizes
+# when calling loo, which allows for better estimates of the PSIS effective
+# sample sizes and Monte Carlo error
+r_eff2 <- relative_eff(exp(log_lik_2), cores = 2) 
+
+# preferably use more than 2 cores (as many cores as possible)
+# will use value of 'mc.cores' option if cores is not specified
+loo_2 <- loo(log_lik_2, r_eff = r_eff2, cores = 2)
+print(loo_2)
+```
+
+## Variable Selection - Ridge Regression
+
+
+```{r}
+# Number of Posterior Samples
+samples<-100000
+# Prior Information
+a<-0.01
+b<-0.01
+p<-9
+# Parameters
+beta2<-matrix(0, nrow=samples, ncol=p)
+lambda2<-rep(0, times=samples)
+neg_two_loglike2<-rep(0, times=samples)
+# Initial Values
+lambda2[1]<-1.00
+# Main Sampling Loop
+for(i in 2:samples){
+   #w Parameters
+   w<-(((1 - y)*rtnorm(n=n, mean=x%*%beta2[(i-1),], sd=1, lower=-Inf, upper=0)) +  
+      ((y)*rtnorm(n=n, mean=x%*%beta2[(i-1),], sd=1, lower=0, upper=Inf)))
+   
+   #beta Parameters
+   beta_cov<-chol2inv(chol(t(x)%*%x + (1/lambda2[i-1])*diag(p))) 
+   beta_mean<-beta_cov%*%(t(x)%*%w)
+   beta2[i,]<-rmnorm(n=1,
+                     mean=beta_mean,
+                     varcov=beta_cov) 
+
+   #lambda Parameter
+   a_new<-(p/2) + a
+   b_new<-t(beta2[i,])%*%beta2[i,]/2 + b
+   lambda2[i]<-1/rgamma(n=1, shape=a_new, rate=b_new)
+
+   #Print to the Screen
+   #print(c("Completion Percentage:", round(100*(i/samples),3)))
+}
+```
+
+```{r}
+burnin<-10000
+thin<-1
+keep_set<-seq((burnin + 1), samples, thin)
+
+est <- colMeans(beta2[keep_set,])
+sd <- apply(beta2[keep_set,],2,sd)
+quantile <- t(apply(beta2[keep_set,],2,quantile, probs=c(0.025,0.5,0.975)))
+# create the table
+res_table <- as.data.frame(cbind(est,sd,quantile))
+rownames(res_table) <- c("AGE","PTEDUCAT","APOE4","FDG_diff","Hippocampus_diff",
+                         "WholeBrain_diff","MidTemp_diff","Gender","Race")
+colnames(res_table) <- c("est","sd","lower","median","upper")
+res_table
+```
+
+```{r}
+beta_vals <- as.data.frame(beta2[keep_set,])
+colnames(beta_vals)  <- c("AGE","PTEDUCAT","APOE4","FDG_diff","Hippocampus_diff",
+                         "WholeBrain_diff","MidTemp_diff","Gender","Race")
+```
+
+```{r}
+# Histograms overlaid with kernel density curve
+g1 <- ggplot(beta_vals, aes(x=AGE)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[1,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[1,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+g2 <- ggplot(beta_vals, aes(x=PTEDUCAT)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[2,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[2,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+g3 <- ggplot(beta_vals, aes(x=APOE4)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[3,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[3,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+g4 <- ggplot(beta_vals, aes(x=FDG_diff)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[4,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[4,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+g5 <- ggplot(beta_vals, aes(x=Hippocampus_diff)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[5,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[5,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+g6 <- ggplot(beta_vals, aes(x=WholeBrain_diff)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[6,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[6,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+g7 <- ggplot(beta_vals, aes(x=MidTemp_diff)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[7,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[7,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+g8 <- ggplot(beta_vals, aes(x=Gender)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[8,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[8,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+g9 <- ggplot(beta_vals, aes(x=Race)) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   bins=30,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666")  +   # Overlay with transparent density plot 
+    geom_vline(aes(xintercept=0), color="blue", linetype="dashed", size=1) + 
+    geom_vline(data = res_table[9,], aes(xintercept=lower), color="red", size=1) + 
+    geom_vline(data = res_table[9,], aes(xintercept=upper), color="red", size=1) + theme_bw()
+
+graphs <- ggarrange(g1,g2,g3,g4,g5,g6,g7,g8,g9,ncol=3,nrow=3)
+graphs
+```
+
+
+## Model 3. Bayesian Logistic Regression 
+
+```{r model3}
+# Model Organization & Posterior Sampling
+x1 <- sd_df[,c("FDG_diff","Hippocampus_diff","MidTemp_diff")]
+x1$FDG_Hipp <- x1$FDG_diff*x1$Hippocampus_diff
+x1$FDG_MidTemp <- x1$FDG_diff*x1$MidTemp_diff
+x1$Hipp_MidTemp <- x1$Hippocampus_diff*x1$MidTemp_diff
+x1 <- as.matrix(x1)
+logit_reg_data2 <- list(y=y, N=n, x=x1, P = 6)
+logit_reg_fit2 <- stan("/Users/jingchen/Desktop/BIS 567/Final Project/logistic_reg.stan", 
+                      data = logit_reg_data2, iter = 100000, warmup = 10000, thin = 10, chains = 3)
+```
+
+```{r}
+# Posterior Inference
+# Summarize the posterior (including effective sample size (n_eff) 
+# and Gelman and Rubin diagnostic (Rhat))
+print(logit_reg_fit2, pars = "beta", probs = c(0.025, 0.5, 0.975))
+```
+
+```{r}
+# Trace plots
+rstan::traceplot(logit_reg_fit2, pars = "beta", inc_warmup=TRUE)
+```
+
+```{r}
+# We can then use the loo package to compute the efficient PSIS-LOO approximation to exact LOO-CV
+# Extract pointwise log-likelihood
+# using merge_chains=FALSE returns an array, which is easier to 
+# use with relative_eff()
+log_lik_3 <- extract_log_lik(logit_reg_fit2, merge_chains = FALSE)
+
+# as of loo v2.0.0 we can optionally provide relative effective sample sizes
+# when calling loo, which allows for better estimates of the PSIS effective
+# sample sizes and Monte Carlo error
+r_eff3 <- relative_eff(exp(log_lik_3), cores = 2) 
+
+# preferably use more than 2 cores (as many cores as possible)
+# will use value of 'mc.cores' option if cores is not specified
+loo_3 <- loo(log_lik_3, r_eff = r_eff3, cores = 2)
+print(loo_3)
+```
+
+
+## Model 4. Bayesian Probit Regression
+
+```{r model4}
+# Model Organization & Posterior Sampling
+probit_reg_fit2 <- stan("/Users/jingchen/Desktop/BIS 567/Final Project/probit_reg.stan", 
+                      data = logit_reg_data2, iter = 100000, warmup = 10000, thin = 10, chains = 3)
+```
+
+
+```{r}
+# Posterior Inference
+# Summarize the posterior (including effective sample size (n_eff) 
+# and Gelman and Rubin diagnostic (Rhat))
+print(probit_reg_fit2, pars = "beta", probs = c(0.025, 0.5, 0.975))
+```
+
+```{r}
+# Trace plots
+rstan::traceplot(probit_reg_fit2, pars = "beta", inc_warmup=TRUE)
+```
+
+
+```{r}
+# We can then use the loo package to compute the efficient PSIS-LOO approximation to exact LOO-CV
+# Extract pointwise log-likelihood
+# using merge_chains=FALSE returns an array, which is easier to 
+# use with relative_eff()
+log_lik_4 <- extract_log_lik(probit_reg_fit2, merge_chains = FALSE)
+
+# as of loo v2.0.0 we can optionally provide relative effective sample sizes
+# when calling loo, which allows for better estimates of the PSIS effective
+# sample sizes and Monte Carlo error
+r_eff4 <- relative_eff(exp(log_lik_4), cores = 2) 
+
+# preferably use more than 2 cores (as many cores as possible)
+# will use value of 'mc.cores' option if cores is not specified
+loo_4 <- loo(log_lik_4, r_eff = r_eff4, cores = 2)
+print(loo_4)
+```
+
+## Model Comparison
+
+We can now compare the models on LOO using the `loo_compare` function:
+
+```{r model comparison1}
+# Compare logistic and probit
+comparison_logit_probit <- loo_compare(loo_1, loo_2)
+print(comparison_logit_probit) # can set simplify=FALSE for more detailed print output
+```
+
+The first column shows the difference in ELPD relative to the model with the largest ELPD. In this case, the difference in elpd and its scale relative to the approximate standard error of the difference) indicates a preference for the second model (model1).
+
+
+```{r model comparison2}
+# Compare logistic and probit after variable selection
+comparison_logit_probit2 <- loo_compare(loo_3, loo_4)
+print(comparison_logit_probit2) # can set simplify=FALSE for more detailed print output
+```
+
+
+```{r model comparison3}
+# Compare logistic and probit after variable selection
+comparison_logit_logit3 <- loo_compare(loo_1, loo_3)
+print(comparison_logit_logit3) # can set simplify=FALSE for more detailed print output
+```
+
+
+```{r}
+# summary elpd for four models 
+models <- c("Model1","Model2","Model3","Model4")
+description <- c("logit","probit","logit_vs","probit_vs")
+elpd_loo <- round(c(loo_1$estimates[1],loo_2$estimates[1],loo_3$estimates[1],loo_4$estimates[1]),1)
+loo_table <- cbind(models,description,elpd_loo)
+loo_table
+```
+
+
+In conclusion, the difference in elpd and its scale relative to the approximate standard error of the difference) indicates a preference for the bayesian logistic regression model after variable selection.  
+
+
+## Mean Squqre Predictive Error (best model)
+
+```{r}
+# reference: https://medium.com/@alex.pavlakis/making-predictions-from-stan-models-in-r-3e349dfac1ed
+# find MSE for the best model
+# Split into training and testing
+set.seed(100)
+N_train <- round(n*0.7)
+N_test <- n-N_train
+train_ind <- sample(c(1:n), size = N_train, replace = FALSE)
+x_train <- x1[train_ind,]
+x_test <- x1[-train_ind,]
+y_train <- y[train_ind]
+y_test <- y[-train_ind]
+
+logit_reg_MSE <- list(x_train=x_train, y_train=y_train, N_train=N_train,x_test=x_test, N_test=N_test, P = 6)
+
+model3_MSE <- stan("/Users/jingchen/Desktop/BIS 567/Final Project/best_MSE.stan",
+            data = logit_reg_MSE, chains = 3, iter = 100000, warmup = 10000, thin = 10)
+```
+
+```{r}
+rstan::traceplot(model3_MSE, pars = c("alpha", "beta"))
+```
+
+```{r}
+ext_fit <- rstan::extract(model3_MSE)
+mean(apply(ext_fit$y_test, 2, median) == y_test)
+```
+
+The model converges and it the posterior distributions of the parameters are centered around their ‘true’ values. The accuracy of the model on new data is 0.85. This is a robust approach for making predictions for new data with Stan, but is impractical if predictions must be made frequently because it requires re-estimating the entire model every time new predictions need to be made.  
+
+
+```{r}
+## option 1
+# accuracy
+ext_fit <- rstan::extract(model3_MSE)
+accuracy_res <- mean(apply(ext_fit$y_test, 2, median) == y_test)
+accuracy_res
+
+# find MSE
+y_test_res <- apply(ext_fit$y_test, 2, median)
+MSE_res = mean((y_test_res-y_test)^2)
+MSE_res
+```
+
+
+
+
+
+
+
+
+
+
+
+
